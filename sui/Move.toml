@@ -1,0 +1,14 @@
+[package]
+name           = 'button-wrappers'
+version        = '1.0.0'
+upgrade_policy = "compatible"
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/mainnet" }
+
+[addresses]
+ButtonWrappers = "43c2e6729314914bbe7458cda2e10ff43813a8aaa1db002ffbb38938d309345c"
+
+[dev-dependencies]
+
+[dev-addresses]
