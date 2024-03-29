@@ -1,7 +1,7 @@
 [package]
 name = 'button-wrappers'
 version = '1.0.0'
-upgrade_policy = "immutable"
+upgrade_policy = "compatible"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-core.git"
@@ -14,4 +14,4 @@ rev = 'mainnet'
 subdir = 'aptos-move/framework/aptos-stdlib'
 
 [addresses]
-ButtonWrappers = "0x4d48f5c877702ba53793b116a7c37c349afbcb197725f1b4b14f4b2f76feca82"
+ButtonWrappers = "43c2e6729314914bbe7458cda2e10ff43813a8aaa1db002ffbb38938d309345c"

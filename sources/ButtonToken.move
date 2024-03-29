@@ -1,413 +1,462 @@
-import 0x1::StandardToken;
-import 0x2::SafeERC20;
-import 0x3::IOracle;
-import 0x4::OwnableUpgradeable;
+module button_token::ButtonToken {
+    use sui::object::{Self, UID};
+    use sui::transfer;
+    use sui::tx_context::{Self, TxContext};
+    use sui::event;
+    use Token::token;
+    use Oracle::oracle;
+    use sui::token::{Self, ActionRequest, Token};
 
-module ButtonWrappers::ButtonToken {
-    use aptos_framework::account::{Self, SignerCapability};
-    use aptos_framework::aptos_account;
-    use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::fungible_asset::{Self, BurnRef, FungibleAsset, Metadata, MintRef};
-    use aptos_framework::object::{Self, Object};
-    use aptos_framework::primary_fungible_store;
-    use aptos_std::smart_table::{Self, SmartTable};
-    use aptos_std::string_utils;
-    use aptos_std::type_info;
-    use std::string::{Self, String};
-    use std::option;
-    use std::signer;
-
-    // Constants
-    const MAX_UINT256: u256;
-    const MAX_UNDERLYING: u256 = 1_000_000_000 * 10 ** 18;
-    const TOTAL_BITS: u256;
-    const BITS_PER_UNDERLYING: u256;
-
-    // Attributes
-    let underlying: address;
-    let oracle: address;
-    let lastPrice: u256;
-    let _epoch: u256;
-    let name: string;
-    let symbol: string;
-    let priceBits: u256;
-    let maxPrice: u256;
-    let _accountBits: map<address, u256>;
-    let _allowances: map<address, map<address, u256>>;
-
-    // Modifiers
-    public(modifier) fn validRecipient(to: address) {
-        assert(to != 0x0, 1);
-        assert(to != move(Self).address, 2);
+    struct ButtonToken {
+        oracle: address,
+        last_price: u256,
+        epoch: u256,
+        name: vector<u8>,
+        symbol: vector<u8>,
+        price_bits: u256,
+        max_price: u256,
+        account_bits: vector<(address, u256)>,
+        allowances: vector<(address, vector<(address, u256)>)>,
     }
 
-    public(modifier) fn onAfterRebase() {
-        let (price, valid) = move(Self)._queryPrice();
+    // event
+    struct Approval {
+        from: address,
+        spender: address,
+        amount: u256
+    }
+
+    struct Transfer {
+        from: address,
+        to: address,
+        amount: u256
+    }
+
+    struct Rebase {
+        epoch: u256,
+        price: u256
+    }
+
+    struct Balance {
+        value: u256;
+    }
+
+    // Only owner can call some action
+    struct OwnerCapability has key { id: UID }
+
+    public const MAX_UINT256: u256 = 2 ** 256 - 1;
+    public const MAX_UNDERLYING: u256 = 1_000_000_000 * 10u256.pow(18);
+    public const TOTAL_BITS: u256 = MAX_UINT256 - (MAX_UINT256 % MAX_UNDERLYING);
+    public const BITS_PER_UNDERLYING: u256 = TOTAL_BITS / MAX_UNDERLYING;
+
+    // modifier
+
+    public fun valid_recipient(to: address) {
+        assert(to != 0x0, "ButtonToken: recipient zero address");
+        assert(to != address_of_sender(), "ButtonToken: recipient token address");
+    }
+
+    public fun after_rebase() acquires ButtonToken {
+        let (price, valid) = query_price();
         if (valid) {
-            move(Self)._rebase(price);
+            rebase(price);
         }
-        _;
     }
 
-    // Owner only actions
-    public fn initialize(underlying_: address, name_: string, symbol_: string, oracle_: address) {
-        assert(underlying_ != 0x0, "ButtonToken: invalid underlying reference");
-        move(OwnableUpgradeable).initialize();
-        Self.underlying = underlying_;
-        Self.name = name_;
-        Self.symbol = symbol_;
-        _accountBits[0x0] = TOTAL_BITS;
-        move(Self).updateOracle(oracle_);
+    // func
+
+    public fun init(owner: &signer, underlying_: address, name_: vector<u8>, symbol_: vector<u8>, oracle_: address) {
+        //TODO: deny if init before
+        let token = ButtonToken {
+            last_price: 0,
+            epoch: 0,
+            name: name_,
+            symbol: symbol_,
+            price_bits: 0,
+            max_price: 0,
+            account_bits: empty_vector(),
+            allowances: empty_vector(),
+        };
+        move_to(owner, token);
     }
 
-    public fn updateOracle(oracle_: address) {
-        let (price, valid) = IOracle(oracle_).getData();
-        require(valid, "ButtonToken: unable to fetch data from oracle");
-        let priceDecimals = IOracle(oracle_).priceDecimals();
-        Self.oracle = oracle_;
-        Self.priceBits = BITS_PER_UNDERLYING * (10 ** move(Self)._toU64(priceDecimals));
-        Self.maxPrice = move(Self).maxPriceFromPriceDecimals(move(Self)._toU64(priceDecimals));
-        Self.emitOracleUpdated(oracle_);
-        move(Self)._rebase(price);
+    public fun get_name(token_ref: &readable): vector<u8> {
+        &move(token_ref).name
     }
 
-    // ERC20 description attributes
-    public fun decimals() {
-        move(StandardToken).decimals(move(Self).underlying);
+    public fun get_symbol(token_ref: &readable): vector<u8> {
+        &move(token_ref).symbol
     }
 
-    // ERC20 token view methods
-    public fun totalSupply() {
-        let price: u256;
-        let valid: bool;
-        (price, valid) = move(Self)._queryPrice();
-        move(Self)._bitsToAmount(move(Self)._activeBits(), price);
+    public fun get_last_price(token_ref: &readable): u256 {
+        &move(token_ref).last_price
     }
 
-    public fun balanceOf(account: address) {
+    public fun get_epoch(token_ref: &readable): u256 {
+        &move(token_ref).epoch
+    }
+
+    public fun decimals(token_ref: &readable): u8 {
+        IERC20Metadata(oracle).decimals();
+    }
+
+    public fun total_supply(token_ref: &readable): u256 {
+        let (price, _) = query_price();
+        bits_to_amount(active_bits(), price);
+    }
+
+    public fun balance_of(token_ref: &readable, account: address): u256 {
         if (account == 0x0) {
-            0;
-        } else {
-            let price: u256;
-            (price, ) = move(Self)._queryPrice();
-            move(Self)._bitsToAmount(move(Self)._accountBits[account], price);
+            return 0;
         }
+        let (price, _) = query_price();
+        bits_to_amount(account_bits[account], price);
     }
 
-    public fun scaledTotalSupply() {
-        move(Self)._bitsToUAmount(move(Self)._activeBits());
+    public fun scaled_total_supply(token_ref: &readable): u256 {
+        bits_to_uamount(active_bits());
     }
 
-    public fun scaledBalanceOf(account: address) {
+    public fun scale_balance_of(token_ref: &readable, account: address): u256 {
         if (account == 0x0) {
-            0;
-        } else {
-            move(Self)._bitsToUAmount(move(Self)._accountBits[account]);
+            return 0;
         }
+        bits_to_uamount(token_ref.account_bits[account]);
     }
 
-    public fun allowance(owner: address, spender: address) {
-        move(Self)._allowances[owner][spender];
+    public fun allowance(token_ref: &readable, owner_: address, spender: address): u256 {
+        token_ref.allowances[owner_][spender];
     }
 
     // ButtonWrapper view methods
-    public fun totalUnderlying() {
-        move(Self)._bitsToUAmount(move(Self)._activeBits());
+    public fun total_underlying(token_ref: &readable): u256 {
+        bits_to_uamount(active_bits());
     }
 
-    public fun balanceOfUnderlying(who: address) {
+    public fun balance_of_underlying(token_ref: &readable, who: address): u256 {
         if (who == 0x0) {
-            0;
+            return 0;
+        }
+        bits_to_uamount(token_ref.account_bits[who]);
+    }
+
+    public fun underlying_to_wrapper(token_ref: &readable, u_amount: u256): u256 {
+        let (price, _) = query_price();
+        bits_to_amount(u_amount_to_bits(u_amount), price);
+    }
+
+    public fun wrapper_to_underlying(token_ref: &readable, amount: u256): u256 {
+        let (price, _) = query_price();
+        bits_to_uamount(amount_to_bits(amount, price));
+    }
+
+    public fun transfer(from: address, to: address, amount: u256): bool {
+        valid_recipient(to);
+        after_rebase();
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        transfer::transfer_from(from, to, amount)
+        true
+    }
+
+    // Function to transfer all tokens
+    public fun transfer_all(ctx: &mut TxContext, to: address): bool {
+        valid_recipient(to);
+        after_rebase();
+        let bits = token_ref.account_bits[address_of_sender()];
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        transfer(token_ref, to, amount);
+        true
+    }
+
+    // Function to transfer tokens from an allowance
+    public fun transfer_from(ctx: &mut TxContext, from: address, to: address, amount: u256): bool {
+        valid_recipient(to);
+        after_rebase();
+        let allowance = token_ref.allowances[from][address_of_sender()];
+        if (allowance != MAX_UINT256) {
+            token_ref.allowances[from][address_of_sender()] = allowance - amount;
+            event::emit(Approval{from, address_of_sender(), token_ref.allowances[from][address_of_sender()]});
+        }
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        transfer(from, to, amount);
+        true
+    }
+
+    // Function to transfer all tokens from an allowance
+    public fun transfer_all_from(token_ref: &mut ButtonToken, from: address, to: address): bool {
+        valid_recipient(to);
+        after_rebase();
+        let bits = token_ref.account_bits[from];
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        let allowance = token_ref.allowances[from][address_of_sender()];
+        if (allowance != MAX_UINT256) {
+            token_ref.allowances[from][address_of_sender()] = allowance - amount;
+            event::emit(Approval{from, address_of_sender(), token_ref.allowances[from][address_of_sender()]});
+        }
+        transfer(from, to, amount);
+        true
+    }
+
+    // Function to approve spending of tokens
+    public fun approve(token_ref: &mut ButtonToken, spender: address, amount: u256): bool {
+        token_ref.allowances[address_of_sender()][spender] = amount;
+        event::emit(Approval{address_of_sender(), spender, amount});
+        true
+    }
+
+    // Function to increase allowance
+    public fun increase_allowance(token_ref: &mut ButtonToken, spender: address, added_amount: u256): bool {
+        token_ref.allowances[address_of_sender()][spender] += added_amount;
+        event::emit(Approval{address_of_sender(), spender, amount});
+        true
+    }
+
+    // Function to decrease allowance
+    public fun decrease_allowance(token_ref: &mut ButtonToken, spender: address, subtracted_amount: u256): bool {
+        let allowance = token_ref.allowances[address_of_sender()][spender];
+        if (subtracted_amount >= allowance) {
+            token_ref.allowances[address_of_sender()][spender] = 0;
         } else {
-            move(Self)._bitsToUAmount(move(Self)._accountBits[who]);
+            token_ref.allowances[address_of_sender()][spender] -= subtracted_amount;
         }
+        event::emit(Approval{address_of_sender(), spender, token_ref.allowances[address_of_sender()][spender]});
+        
+        true
     }
 
-    public fun underlyingToWrapper(uAmount: u256) {
-        let price: u256;
-        (price, ) = move(Self)._queryPrice();
-        move(Self)._bitsToAmount(move(Self)._uAmountToBits(uAmount), price);
-    }
-
-    public fun wrapperToUnderlying(amount: u256) {
-        let price: u256;
-        (price, ) = move(Self)._queryPrice();
-        move(Self)._bitsToUAmount(move(Self)._amountToBits(amount, price));
-    }
-
-    // ERC20 write methods
-    public fn transfer(to: address, amount: u256) {
-        move(Self)._transfer(move(StandardToken).default_account(), to, move(Self)._amountToBits(amount, move(Self).lastPrice), amount);
-    }
-
-    public fn transferAll(to: address) {
-        let bits = move(Self)._accountBits[move(StandardToken).default_account()];
-        move(Self)._transfer(move(StandardToken).default_account(), to, bits, move(Self)._bitsToAmount(bits, move(Self).lastPrice));
-    }
-
-    public fn transferFrom(from: address, to: address, amount: u256) {
-        if (move(Self)._allowances[from][move(StandardToken).default_account()] != MAX_UINT256) {
-            move(Self)._allowances[from][move(StandardToken).default_account()] -= amount;
-        }
-        move(Self)._transfer(from, to, move(Self)._amountToBits(amount, move(Self).lastPrice), amount);
-    }
-
-    public fn transferAllFrom(from: address, to: address) {
-        let bits = move(Self)._accountBits[from];
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        if (move(Self)._allowances[from][move(StandardToken).default_account()] != MAX_UINT256) {
-            move(Self)._allowances[from][move(StandardToken).default_account()] -= amount;
-        }
-        move(Self)._transfer(from, to, bits, amount);
-    }
-
-    public fn approve(spender: address, amount: u256) {
-        move(Self)._allowances[move(StandardToken).default_account()][spender] = amount;
-    }
-
-    public fn increaseAllowance(spender: address, addedAmount: u256) {
-        move(Self)._allowances[move(StandardToken).default_account()][spender] += addedAmount;
-    }
-
-    public fn decreaseAllowance(spender: address, subtractedAmount: u256) {
-        if (subtractedAmount >= move(Self)._allowances[move(StandardToken).default_account()][spender]) {
-            move(Self)._allowances[move(StandardToken).default_account()][spender] = 0;
-        } else {
-            move(Self)._allowances[move(StandardToken).default_account()][spender] -= subtractedAmount;
-        }
-    }
-
-    // RebasingERC20 write methods
-    public fn rebase() {
+    public fun rebase(token_ref: &mut ButtonToken) {
         return;
     }
 
     // ButtonWrapper write methods
-    public fn mint(amount: u256) {
-        let bits = move(Self)._amountToBits(amount, move(Self).lastPrice);
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        move(Self)._deposit(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return uAmount;
+    public fun mint(token_ref: &mut ButtonToken, amount: u256): u256 {
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        let u_amount = bits_to_uamount(bits);
+        Token::transfer(address_of_sender(), token_ref, amount);
+        u_amount
     }
 
-    public fn mintFor(to: address, amount: u256) {
-        let bits = move(Self)._amountToBits(amount, move(Self).lastPrice);
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        move(Self)._deposit(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return uAmount;
+    public fun mint_for(token_ref: &mut ButtonToken, to: address, amount: u256): u256 {
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        let u_amount = bits_to_uamount(bits);
+        Token::transfer(address_of_sender(), token_ref, amount);
+        u_amount
     }
 
-    public fn burn(amount: u256) {
-        let bits = move(Self)._amountToBits(amount, move(Self).lastPrice);
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        move(Self)._withdraw(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return uAmount;
+    public fun burn(token_ref: &mut ButtonToken, amount: u256): u256 {
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        let u_amount = bits_to_uamount(bits);
+        withdraw(move_from(token_ref), address_of_sender(), u_amount, amount, bits);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        u_amount
     }
 
-    public fn burnTo(to: address, amount: u256) {
-        let bits = move(Self)._amountToBits(amount, move(Self).lastPrice);
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        move(Self)._withdraw(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return uAmount;
+    public fun burn_to(token_ref: &mut ButtonToken, to: address, amount: u256): u256 {
+        let bits = amount_to_bits(amount, token_ref.last_price);
+        let u_amount = bits_to_uamount(bits);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        u_amount
     }
 
-    public fn burnAll() {
-        let bits = move(Self)._accountBits[move(StandardToken).default_account()];
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return uAmount;
+    public fun burn_all(token_ref: &mut ButtonToken): u256 {
+        let bits = token_ref.account_bits[address_of_sender()];
+        let u_amount = bits_to_uamount(bits);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        u_amount
     }
 
-    public fn burnAllTo(to: address) {
-        let bits = move(Self)._accountBits[move(StandardToken).default_account()];
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return uAmount;
+    public fun burn_all_to(token_ref: &mut ButtonToken, to: address): u256 {
+        let bits = token_ref.account_bits[address_of_sender()];
+        let u_amount = bits_to_uamount(bits);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        u_amount
     }
 
-    public fn deposit(uAmount: u256) {
-        let bits = move(Self)._uAmountToBits(uAmount);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._deposit(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return amount;
+    public fun deposit(token_ref: &mut ButtonToken, u_amount: u256): u256 {
+        let bits = u_amount_to_bits(u_amount);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(address_of_sender(), token_ref, amount);
+        amount
     }
 
-    public fn depositFor(to: address, uAmount: u256) {
-        let bits = move(Self)._uAmountToBits(uAmount);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._deposit(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return amount;
+    public fun deposit_for(token_ref: &mut ButtonToken, to: address, u_amount: u256): u256 {
+        let bits = u_amount_to_bits(u_amount);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(address_of_sender(), token_ref, amount);
+        amount
     }
 
-    public fn withdraw(uAmount: u256) {
-        let bits = move(Self)._uAmountToBits(uAmount);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return amount;
+    public fun withdraw(token_ref: &mut ButtonToken, u_amount: u256): u256 {
+        let bits = u_amount_to_bits(u_amount);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        withdraw(move_from(token_ref), address_of_sender(), u_amount, amount, bits);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        amount
     }
 
-    public fn withdrawTo(to: address, uAmount: u256) {
-        let bits = move(Self)._uAmountToBits(uAmount);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return amount;
+    public fun withdraw_to(token_ref: &mut ButtonToken, to: address, u_amount: u256): u256 {
+        let bits = u_amount_to_bits(u_amount);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        amount
     }
 
-    public fn withdrawAll() {
-        let bits = move(Self)._accountBits[move(StandardToken).default_account()];
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), move(StandardToken).default_account(), uAmount, amount, bits);
-        return amount;
+    public fun withdraw_all(token_ref: &mut ButtonToken): u256 {
+        let bits = token_ref.account_bits[address_of_sender()];
+        let u_amount = bits_to_uamount(bits);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        amount
     }
 
-    public fn withdrawAllTo(to: address) {
-        let bits = move(Self)._accountBits[move(StandardToken).default_account()];
-        let uAmount = move(Self)._bitsToUAmount(bits);
-        let amount = move(Self)._bitsToAmount(bits, move(Self).lastPrice);
-        move(Self)._withdraw(move(StandardToken).default_account(), to, uAmount, amount, bits);
-        return amount;
+    public fun withdraw_all_to(token_ref: &mut ButtonToken, to: address): u256 {
+        let bits = token_ref.account_bits[address_of_sender()];
+        let u_amount = bits_to_uamount(bits);
+        let amount = bits_to_amount(bits, token_ref.last_price);
+        Token::transfer(token_ref, address_of_sender(), amount);
+        amount
     }
 
-    // Private methods
-    fun _deposit(from: address, to: address, uAmount: u256, amount: u256, bits: u256) {
-        assert(uAmount > 0, "ButtonToken: No tokens deposited");
-        assert(amount > 0, "ButtonToken: too few button tokens to mint");
-        SafeERC20.safe_transfer_from(move(Self).underlying, from, move(Self).address, uAmount);
-        move(Self)._transfer(0x0, to, bits, amount);
+    public fun deposit(
+        token_ref: &mut ButtonToken,
+        from: address,
+        to: address,
+        u_amount: u256,
+        amount: u256,
+        bits: u256
+    ) {
+        assert(u_amount > 0, 0x0); // "ButtonToken: No tokens deposited"
+        assert(amount > 0, 0x1); // "ButtonToken: too few button tokens to mint"
+        transfer(from, move_from(token_ref), bits, amount);
+        Token::transfer(address_of_sender(), token_ref, amount);
     }
 
-    fun _withdraw(from: address, to: address, uAmount: u256, amount: u256, bits: u256) {
-        assert(amount > 0, "ButtonToken: too few button tokens to burn");
-        move(Self)._transfer(from, 0x0, bits, amount);
-        SafeERC20.safe_transfer(move(Self).underlying, to, uAmount);
-    }
+    // Function to withdraw
+    public fun withdraw(
+        token_ref: &mut ButtonToken,
+        from: address,
+        to: address,
+        u_amount: u256,
+        amount: u256,
+        bits: u256
+    ) {
+        assert(amount > 0, 0x2); // "ButtonToken: too few button tokens to burn"
 
-    fun _transfer(from: address, to: address, bits: u256, amount: u256) {
-        move(Self)._accountBits[from] = move(Self)._accountBits[from] - bits;
-        move(Self)._accountBits[to] = move(Self)._accountBits[to] + bits;
-        emit Transfer<address, address, u256>(from, to, amount);
-        if (move(Self)._accountBits[from] == 0) {
-            move(Self)._accountBits[from] = 0;
+        transfer(move_from(token_ref), from, bits, amount);
+
+        Token::transfer(address_of_sender(), token_ref, amount);    }
+
+    // Function to transfer
+    public fun transfer(token_ref: &mut ButtonToken, from: address, to: address, bits: u256, amount: u256) {
+        token_ref.account_bits[from] -= bits;
+        token_ref.account_bits[to] += bits;
+
+        event::emit(Transfer{from, to, amount});
+
+        if (token_ref.account_bits[from] == 0) {
+            delete token_ref.account_bits[from];
         }
     }
 
-    fun _rebase(price: u256) {
-        let maxPrice = move(Self).maxPrice;
-        if (price > maxPrice) {
-            price = maxPrice;
+    // Function to rebase
+    public fun rebase(token_ref: &mut ButtonToken, price: u256) {
+        let max_price = token_ref.max_price;
+        let new_price = if (price > max_price) { max_price } else { price };
+
+        token_ref.last_price = new_price;
+        token_ref.epoch += 1;
+
+        event::emit(Rebase{token_ref.epoch, new_price});
+    }
+
+    // Function to calculate active bits
+    public fun active_bits(token_ref: &ButtonToken): u256 {
+        TOTAL_BITS - token_ref.account_bits[0x1]
+    }
+
+    // Function to query price from oracle
+    public fun query_price(token_ref: &ButtonToken): (u256, bool) {
+        let (new_price, valid) = oracle::get_data();
+
+        // Note: we consider newPrice == 0 to be invalid because accounting fails with price == 0
+        // For example, _bitsPerToken needs to be able to divide by price so a div/0 is caused
+        if (valid && new_price > 0) {
+            (new_price, true)
+        } else {
+            (token_ref.last_price, false)
         }
-        Self.lastPrice = price;
-        Self._epoch = Self._epoch + 1;
-        emit Rebase<u256, u256>(Self._epoch, price);
     }
 
-    fun _activeBits(): u256 {
-        TOTAL_BITS - move(Self)._accountBits[0x0];
+    // Function to convert amount to bits
+    public fun amount_to_bits(amount: u256, price: u256): u256 {
+        amount * bits_per_token(price)
     }
 
-    fun _queryPrice(): u256 {
-        let (newPrice, valid) = IOracle(get(Self).oracle).getData();
-        return valid && newPrice > 0 ? newPrice : get(Self).lastPrice;
+    // Function to convert u_amount to bits
+    public fun u_amount_to_bits(u_amount: u256): u256 {
+        u_amount * BITS_PER_UNDERLYING
     }
 
-    fun _amountToBits(amount: u256, price: u256): u256 {
-        amount * get(Self)._bitsPerToken(price)
+    // Function to convert bits to amount
+    public fun bits_to_amount(bits: u256, price: u256): u256 {
+        bits / bits_per_token(price)
     }
 
-    fun _uAmountToBits(uAmount: u256): u256 {
-        uAmount * BITS_PER_UNDERLYING
-    }
-
-    fun _bitsToAmount(bits: u256, price: u256): u256 {
-        bits / get(Self)._bitsPerToken(price)
-    }
-
-    fun _bitsToUAmount(bits: u256): u256 {
+    // Function to convert bits to u_amount
+    public fun bits_to_u_amount(bits: u256): u256 {
         bits / BITS_PER_UNDERLYING
     }
 
-    fun _bitsPerToken(price: u256): u256 {
-        get(Self).priceBits / price
+    // Function to calculate bits per token
+    public fun bits_per_token(price: u256): u256 {
+        price_bits / price
     }
 
-    public fun maxPriceFromPriceDecimals(priceDecimals: u256): u256 {
-        assert(priceDecimals <= 18, "ButtonToken: Price Decimals must be under 18");
 
-        if (priceDecimals == 18) {
-            return 2 ** 113 - 1;
-        }
+    public fun max_price_from_price_decimals(price_decimals: u256): u256 {
+        assert(price_decimals <= 18, 0x3); // "ButtonToken: Price Decimals must be under 18"
 
-        if (priceDecimals == 8) {
-            return 2 ** 96 - 1;
+        if price_decimals == 18 {
+            2u256 ** 113 - 1
+        } else if price_decimals == 8 {
+            2u256 ** 96 - 1
+        } else if price_decimals == 6 {
+            2u256 ** 93 - 1
+        } else if price_decimals == 0 {
+            2u256 ** 83 - 1
+        } else if price_decimals == 1 {
+            2u256 ** 84 - 1
+        } else if price_decimals == 2 {
+            2u256 ** 86 - 1
+        } else if price_decimals == 3 {
+            2u256 ** 88 - 1
+        } else if price_decimals == 4 {
+            2u256 ** 89 - 1
+        } else if price_decimals == 5 {
+            2u256 ** 91 - 1
+        } else if price_decimals == 7 {
+            2u256 ** 94 - 1
+        } else if price_decimals == 9 {
+            2u256 ** 98 - 1
+        } else if price_decimals == 10 {
+            2u256 ** 99 - 1
+        } else if price_decimals == 11 {
+            2u256 ** 101 - 1
+        } else if price_decimals == 12 {
+            2u256 ** 103 - 1
+        } else if price_decimals == 13 {
+            2u256 ** 104 - 1
+        } else if price_decimals == 14 {
+            2u256 ** 106 - 1
+        } else if price_decimals == 15 {
+            2u256 ** 108 - 1
+        } else if price_decimals == 16 {
+            2u256 ** 109 - 1
+        } else {
+            // priceDecimals == 17
+            2u256 ** 111 - 1
         }
-
-        if (priceDecimals == 6) {
-            return 2 ** 93 - 1;
-        }
-
-        if (priceDecimals == 0) {
-            return 2 ** 83 - 1;
-        }
-
-        if (priceDecimals == 1) {
-            return 2 ** 84 - 1;
-        }
-
-        if (priceDecimals == 2) {
-            return 2 ** 86 - 1;
-        }
-
-        if (priceDecimals == 3) {
-            return 2 ** 88 - 1;
-        }
-
-        if (priceDecimals == 4) {
-            return 2 ** 89 - 1;
-        }
-
-        if (priceDecimals == 5) {
-            return 2 ** 91 - 1;
-        }
-
-        if (priceDecimals == 7) {
-            return 2 ** 94 - 1;
-        }
-
-        if (priceDecimals == 9) {
-            return 2 ** 98 - 1;
-        }
-
-        if (priceDecimals == 10) {
-            return 2 ** 99 - 1;
-        }
-
-        if (priceDecimals == 11) {
-            return 2 ** 101 - 1;
-        }
-
-        if (priceDecimals == 12) {
-            return 2 ** 103 - 1;
-        }
-
-        if (priceDecimals == 13) {
-            return 2 ** 104 - 1;
-        }
-
-        if (priceDecimals == 14) {
-            return 2 ** 106 - 1;
-        }
-
-        if (priceDecimals == 15) {
-            return 2 ** 108 - 1;
-        }
-
-        if (priceDecimals == 16) {
-            return 2 ** 109 - 1;
-        }
-        // priceDecimals == 17
-        return 2 ** 111 - 1;
     }
 }
